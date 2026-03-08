@@ -6,7 +6,7 @@ function mapStatus(notionStatus) {
   const s = notionStatus.toLowerCase();
   if (s.includes("complet") || s.includes("posted") || s.includes("published")) return "posted";
   if (s.includes("schedul") || s.includes("ready")) return "ready";
-  return "draft"; // content creating, in progress, etc
+  return "draft";
 }
 
 function reverseStatus(gridStatus) {
@@ -62,29 +62,36 @@ export default async function handler(req) {
         body: JSON.stringify({ page_size: 100 }),
       });
 
+      const rawText = await res.text();
+
       if (!res.ok) {
-        const err = await res.json();
-        return new Response(JSON.stringify({ ok: false, error: err.message || `Notion error ${res.status}` }), {
-          status: res.status, headers: { ...cors, "Content-Type": "application/json" }
+        // Return full Notion error so we can see exactly what's wrong
+        return new Response(JSON.stringify({ 
+          ok: false, 
+          error: `Notion ${res.status}: ${rawText}` 
+        }), {
+          status: 200, headers: { ...cors, "Content-Type": "application/json" }
         });
       }
 
-      const data = await res.json();
+      const data = JSON.parse(rawText);
       const mapped = data.results.map(page => ({
         id: page.id,
         title:
           page.properties?.Name?.title?.[0]?.plain_text ||
           page.properties?.Title?.title?.[0]?.plain_text ||
           "Untitled",
-        status: mapStatus(page.properties?.Status?.status?.name || page.properties?.Status?.select?.name),
+        status: mapStatus(
+          page.properties?.Status?.status?.name ||
+          page.properties?.Status?.select?.name ||
+          ""
+        ),
         date:
-          page.properties?.Date?.date?.start ||
-          page.properties?.["Published Date"]?.date?.start ||
-          page.properties?.["Published Da"]?.date?.start ||
-          "",
+          page.properties?.Date?.date?.start || "",
         caption: page.properties?.Caption?.rich_text?.[0]?.plain_text || "",
         hashtags: page.properties?.Hashtags?.rich_text?.[0]?.plain_text || "",
-        label: page.properties?.Label?.rich_text?.[0]?.plain_text || "",
+        label: page.properties?.["Planning Status"]?.status?.name || 
+               page.properties?.["Planning Status"]?.select?.name || "",
         platform: page.properties?.["Platform(s)"]?.multi_select?.map(p => p.name).join(", ") || "",
       }));
 
@@ -96,27 +103,29 @@ export default async function handler(req) {
     // ── PUSH ──────────────────────────────────────────────────────────
     if (action === "push" && pages?.length) {
       let created = 0;
+      const errors = [];
       for (const post of pages) {
         const props = {
           Name: { title: [{ text: { content: post.label || `Post ${post.position}` } }] },
           ...(post.postDate ? { Date: { date: { start: post.postDate } } } : {}),
           ...(post.caption ? { Caption: { rich_text: [{ text: { content: post.caption } }] } } : {}),
           ...(post.hashtags ? { Hashtags: { rich_text: [{ text: { content: post.hashtags } }] } } : {}),
+          ...(post.status ? { Status: { select: { name: reverseStatus(post.status) } } } : {}),
         };
-
-        // Only set Status if the property exists — use Notion's select type
-        if (post.status) {
-          props.Status = { status: { name: reverseStatus(post.status) } };
-        }
 
         const res = await fetch("https://api.notion.com/v1/pages", {
           method: "POST",
           headers: notionHeaders,
           body: JSON.stringify({ parent: { database_id: databaseId }, properties: props }),
         });
-        if (res.ok) created++;
+        if (res.ok) {
+          created++;
+        } else {
+          const err = await res.text();
+          errors.push(err);
+        }
       }
-      return new Response(JSON.stringify({ ok: true, created }), {
+      return new Response(JSON.stringify({ ok: true, created, errors }), {
         headers: { ...cors, "Content-Type": "application/json" }
       });
     }
@@ -126,7 +135,7 @@ export default async function handler(req) {
     });
 
   } catch (err) {
-    return new Response(JSON.stringify({ ok: false, error: err.message }), {
+    return new Response(JSON.stringify({ ok: false, error: err.message, stack: err.stack }), {
       status: 500, headers: { ...cors, "Content-Type": "application/json" }
     });
   }
