@@ -1,24 +1,33 @@
 // Vercel Edge Function — Notion API Proxy
-// Deploy this to Vercel to bypass CORS restrictions
-// Then update the Grid Studio artifact to call YOUR_VERCEL_URL/api/notion
-
 export const config = { runtime: "edge" };
 
 export default async function handler(req) {
-  // Allow requests from anywhere (including Claude artifacts)
   const cors = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Allow-Private-Network": "true",
   };
 
-  // Handle preflight
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: cors });
   }
 
+  if (req.method === "GET") {
+    return new Response(JSON.stringify({ ok: true, message: "Notion proxy is running ✦" }), {
+      headers: { ...cors, "Content-Type": "application/json" }
+    });
+  }
+
   try {
-    const { token, databaseId, action, pages } = await req.json();
+    const body = await req.text();
+    if (!body) {
+      return new Response(JSON.stringify({ ok: false, error: "Empty request body" }), {
+        status: 400, headers: { ...cors, "Content-Type": "application/json" }
+      });
+    }
+
+    const { token, databaseId, action, pages } = JSON.parse(body);
 
     if (!token || !databaseId) {
       return new Response(JSON.stringify({ ok: false, error: "Missing token or databaseId" }), {
@@ -32,7 +41,6 @@ export default async function handler(req) {
       "Content-Type": "application/json",
     };
 
-    // ── FETCH: query database ─────────────────────────────────────────
     if (action === "fetch") {
       const res = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
         method: "POST",
@@ -42,7 +50,7 @@ export default async function handler(req) {
 
       if (!res.ok) {
         const err = await res.json();
-        return new Response(JSON.stringify({ ok: false, error: err.message || "Notion API error" }), {
+        return new Response(JSON.stringify({ ok: false, error: err.message || `Notion error ${res.status}` }), {
           status: res.status, headers: { ...cors, "Content-Type": "application/json" }
         });
       }
@@ -50,8 +58,8 @@ export default async function handler(req) {
       const data = await res.json();
       const mapped = data.results.map(page => ({
         id: page.id,
-        title: page.properties?.Name?.title?.[0]?.plain_text || page.properties?.["Post Name"]?.title?.[0]?.plain_text || "Untitled",
-        status: page.properties?.Status?.select?.name || "draft",
+        title: page.properties?.Name?.title?.[0]?.plain_text || page.properties?.Title?.title?.[0]?.plain_text || "Untitled",
+        status: page.properties?.Status?.select?.name || "Draft",
         date: page.properties?.Date?.date?.start || "",
         caption: page.properties?.Caption?.rich_text?.[0]?.plain_text || "",
         hashtags: page.properties?.Hashtags?.rich_text?.[0]?.plain_text || "",
@@ -63,7 +71,6 @@ export default async function handler(req) {
       });
     }
 
-    // ── PUSH: create pages ────────────────────────────────────────────
     if (action === "push" && pages?.length) {
       let created = 0;
       for (const post of pages) {
