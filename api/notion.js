@@ -1,12 +1,25 @@
 // Vercel Edge Function — Notion API Proxy
 export const config = { runtime: "edge" };
 
+function mapStatus(notionStatus) {
+  if (!notionStatus) return "draft";
+  const s = notionStatus.toLowerCase();
+  if (s.includes("complet") || s.includes("posted") || s.includes("published")) return "posted";
+  if (s.includes("schedul") || s.includes("ready")) return "ready";
+  return "draft"; // content creating, in progress, etc
+}
+
+function reverseStatus(gridStatus) {
+  if (gridStatus === "posted") return "Completed";
+  if (gridStatus === "ready") return "scheduled";
+  return "content creating";
+}
+
 export default async function handler(req) {
   const cors = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "*",
-    "Access-Control-Allow-Private-Network": "true",
   };
 
   if (req.method === "OPTIONS") {
@@ -41,11 +54,12 @@ export default async function handler(req) {
       "Content-Type": "application/json",
     };
 
+    // ── FETCH ─────────────────────────────────────────────────────────
     if (action === "fetch") {
       const res = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
         method: "POST",
         headers: notionHeaders,
-        body: JSON.stringify({ page_size: 100, sorts: [{ property: "Date", direction: "ascending" }] }),
+        body: JSON.stringify({ page_size: 100 }),
       });
 
       if (!res.ok) {
@@ -58,12 +72,20 @@ export default async function handler(req) {
       const data = await res.json();
       const mapped = data.results.map(page => ({
         id: page.id,
-        title: page.properties?.Name?.title?.[0]?.plain_text || page.properties?.Title?.title?.[0]?.plain_text || "Untitled",
-        status: page.properties?.Status?.select?.name || "Draft",
-        date: page.properties?.Date?.date?.start || "",
+        title:
+          page.properties?.Name?.title?.[0]?.plain_text ||
+          page.properties?.Title?.title?.[0]?.plain_text ||
+          "Untitled",
+        status: mapStatus(page.properties?.Status?.status?.name || page.properties?.Status?.select?.name),
+        date:
+          page.properties?.Date?.date?.start ||
+          page.properties?.["Published Date"]?.date?.start ||
+          page.properties?.["Published Da"]?.date?.start ||
+          "",
         caption: page.properties?.Caption?.rich_text?.[0]?.plain_text || "",
         hashtags: page.properties?.Hashtags?.rich_text?.[0]?.plain_text || "",
         label: page.properties?.Label?.rich_text?.[0]?.plain_text || "",
+        platform: page.properties?.["Platform(s)"]?.multi_select?.map(p => p.name).join(", ") || "",
       }));
 
       return new Response(JSON.stringify({ ok: true, pages: mapped }), {
@@ -71,22 +93,26 @@ export default async function handler(req) {
       });
     }
 
+    // ── PUSH ──────────────────────────────────────────────────────────
     if (action === "push" && pages?.length) {
       let created = 0;
       for (const post of pages) {
+        const props = {
+          Name: { title: [{ text: { content: post.label || `Post ${post.position}` } }] },
+          ...(post.postDate ? { Date: { date: { start: post.postDate } } } : {}),
+          ...(post.caption ? { Caption: { rich_text: [{ text: { content: post.caption } }] } } : {}),
+          ...(post.hashtags ? { Hashtags: { rich_text: [{ text: { content: post.hashtags } }] } } : {}),
+        };
+
+        // Only set Status if the property exists — use Notion's select type
+        if (post.status) {
+          props.Status = { status: { name: reverseStatus(post.status) } };
+        }
+
         const res = await fetch("https://api.notion.com/v1/pages", {
           method: "POST",
           headers: notionHeaders,
-          body: JSON.stringify({
-            parent: { database_id: databaseId },
-            properties: {
-              Name: { title: [{ text: { content: post.label || `Post ${post.position}` } }] },
-              Status: { select: { name: post.status === "ready" ? "Ready" : post.status === "posted" ? "Posted" : "Draft" } },
-              ...(post.postDate ? { Date: { date: { start: post.postDate } } } : {}),
-              Caption: { rich_text: [{ text: { content: post.caption || "" } }] },
-              Hashtags: { rich_text: [{ text: { content: post.hashtags || "" } }] },
-            },
-          }),
+          body: JSON.stringify({ parent: { database_id: databaseId }, properties: props }),
         });
         if (res.ok) created++;
       }
